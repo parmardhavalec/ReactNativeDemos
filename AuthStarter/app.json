@@ -7,6 +7,17 @@
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "scheme": "authstarter",
+    
+"plugins": [
+  "@maplibre/maplibre-react-native",
+  [
+    "expo-location",
+    {
+      "locationWhenInUsePermission": "Allow AuthStarter to use your location while you use the map."
+    }
+  ]
+]
+,
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.anonymous.AuthStarter"
