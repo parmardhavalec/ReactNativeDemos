@@ -16,6 +16,8 @@ import {
   Map,
   Camera,
   ViewAnnotation,
+  GeoJSONSource,
+  Layer,
   type CameraRef,
 } from '@maplibre/maplibre-react-native';
 
@@ -29,13 +31,21 @@ import {
   type FavoritePlace,
 } from '../services/favoriteService';
 
+import {
+  getDrivingRoute,
+  formatDistance,
+  formatDuration,
+  type RouteResult,
+  type Coordinates,
+} from '../services/directionsService';
+
 type Props = {
   email: string;
   loading: boolean;
   onLogout: () => void;
 };
 
-const INITIAL_CENTER: [number, number] = [72.5714, 23.0225];
+const INITIAL_CENTER: Coordinates = [72.5714, 23.0225];
 
 export default function HomeScreen({
   email,
@@ -47,6 +57,7 @@ export default function HomeScreen({
   const [locationLoading, setLocationLoading] = useState(false);
   const [searchLoading, setSearchLoading] = useState(false);
   const [favoriteLoading, setFavoriteLoading] = useState(false);
+  const [routeLoading, setRouteLoading] = useState(false);
 
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<Place[]>([]);
@@ -57,10 +68,13 @@ export default function HomeScreen({
   const [showFavorites, setShowFavorites] = useState(false);
 
   const [userCoordinates, setUserCoordinates] =
-    useState<[number, number] | null>(null);
+    useState<Coordinates | null>(null);
 
   const [selectedPlace, setSelectedPlace] =
     useState<Place | null>(null);
+
+  const [route, setRoute] = useState<RouteResult | null>(null);
+  const [showDirections, setShowDirections] = useState(false);
 
   // Load the signed-in user's favorites from Supabase.
   const loadFavoritePlaces = async () => {
@@ -85,10 +99,9 @@ export default function HomeScreen({
     void loadFavoritePlaces();
   }, []);
 
-  // Move the camera after the map is visible.
-  // This also works when opening a favorite from the list.
+  // Move the camera when a place is selected.
   useEffect(() => {
-    if (!showFavorites && selectedPlace) {
+    if (!showFavorites && selectedPlace && !route) {
       cameraRef.current?.easeTo({
         center: [
           selectedPlace.longitude,
@@ -98,7 +111,7 @@ export default function HomeScreen({
         duration: 1000,
       });
     }
-  }, [selectedPlace, showFavorites]);
+  }, [selectedPlace, showFavorites, route]);
 
   // Search for a city, address, or landmark.
   const handleSearch = async () => {
@@ -134,8 +147,10 @@ export default function HomeScreen({
     }
   };
 
-  // Select a search result and show it on the map.
+  // Select a search result.
   const selectPlace = (place: Place) => {
+    setRoute(null);
+    setShowDirections(false);
     setSelectedPlace(place);
     setResults([]);
     setHasSearched(false);
@@ -145,6 +160,9 @@ export default function HomeScreen({
 
   // Open a saved favorite on the map.
   const openFavoriteOnMap = (place: FavoritePlace) => {
+    setRoute(null);
+    setShowDirections(false);
+
     setSelectedPlace({
       id: place.id,
       name: place.name,
@@ -160,30 +178,33 @@ export default function HomeScreen({
     Keyboard.dismiss();
   };
 
+  // Obtain the current device location.
+  const getCurrentCoordinates = async (): Promise<Coordinates> => {
+    const permission =
+      await Location.requestForegroundPermissionsAsync();
+
+    if (!permission.granted) {
+      throw new Error(
+        'Location permission is required. Allow location access in your device settings and try again.',
+      );
+    }
+
+    const location = await Location.getCurrentPositionAsync({
+      accuracy: Location.Accuracy.Balanced,
+    });
+
+    return [
+      location.coords.longitude,
+      location.coords.latitude,
+    ];
+  };
+
   // Show the device's current location.
   const showMyLocation = async () => {
     try {
       setLocationLoading(true);
 
-      const permission =
-        await Location.requestForegroundPermissionsAsync();
-
-      if (!permission.granted) {
-        Alert.alert(
-          'Location permission',
-          'Allow location access in your device settings to show your position on the map.',
-        );
-        return;
-      }
-
-      const location = await Location.getCurrentPositionAsync({
-        accuracy: Location.Accuracy.Balanced,
-      });
-
-      const coordinates: [number, number] = [
-        location.coords.longitude,
-        location.coords.latitude,
-      ];
+      const coordinates = await getCurrentCoordinates();
 
       setUserCoordinates(coordinates);
 
@@ -197,10 +218,92 @@ export default function HomeScreen({
 
       Alert.alert(
         'Location unavailable',
-        'Could not retrieve your location. Please check your device location settings and try again.',
+        error instanceof Error
+          ? error.message
+          : 'Could not retrieve your location. Check your device settings and try again.',
       );
     } finally {
       setLocationLoading(false);
+    }
+  };
+
+  // Calculate and display a driving route to the selected place.
+  const handleGetDirections = async () => {
+    if (!selectedPlace || routeLoading) {
+      return;
+    }
+
+    try {
+      Keyboard.dismiss();
+      setRouteLoading(true);
+      setRoute(null);
+      setShowDirections(false);
+
+      const origin = await getCurrentCoordinates();
+      setUserCoordinates(origin);
+
+      const destination: Coordinates = [
+        selectedPlace.longitude,
+        selectedPlace.latitude,
+      ];
+
+      const result = await getDrivingRoute(origin, destination);
+
+      setRoute(result);
+      setShowDirections(true);
+
+      // Fit the entire route into the map viewport.
+      const longitudes = result.coordinates.map((point) => point[0]);
+      const latitudes = result.coordinates.map((point) => point[1]);
+
+      const west = Math.min(...longitudes);
+      const east = Math.max(...longitudes);
+      const south = Math.min(...latitudes);
+      const north = Math.max(...latitudes);
+
+      if (west === east && south === north) {
+        cameraRef.current?.easeTo({
+          center: origin,
+          zoom: 15,
+          duration: 1000,
+        });
+      } else {
+        cameraRef.current?.fitBounds(
+          [west, south, east, north],
+          {
+            padding: { top: 50, right: 40, bottom: 70, left: 40 },
+            duration: 1000,
+          },
+        );
+      }
+    } catch (error) {
+      console.error('Unable to calculate route:', error);
+
+      Alert.alert(
+        'Directions unavailable',
+        error instanceof Error
+          ? error.message
+          : 'Could not calculate a route. Check your internet connection and try again.',
+      );
+    } finally {
+      setRouteLoading(false);
+    }
+  };
+
+  // Clear the current route without clearing the selected place.
+  const clearRoute = () => {
+    setRoute(null);
+    setShowDirections(false);
+
+    if (selectedPlace) {
+      cameraRef.current?.easeTo({
+        center: [
+          selectedPlace.longitude,
+          selectedPlace.latitude,
+        ],
+        zoom: 15,
+        duration: 700,
+      });
     }
   };
 
@@ -285,6 +388,8 @@ export default function HomeScreen({
 
       if (selectedPlace?.id === place.id) {
         setSelectedPlace(null);
+        setRoute(null);
+        setShowDirections(false);
       }
     } catch (error) {
       console.error('Unable to remove favorite:', error);
@@ -301,6 +406,17 @@ export default function HomeScreen({
       setFavoriteLoading(false);
     }
   };
+
+  const routeGeoJSON = route
+    ? {
+        type: 'Feature' as const,
+        properties: {},
+        geometry: {
+          type: 'LineString' as const,
+          coordinates: route.coordinates,
+        },
+      }
+    : null;
 
   return (
     <View style={styles.container}>
@@ -324,6 +440,8 @@ export default function HomeScreen({
             } else {
               setShowFavorites(true);
               setSelectedPlace(null);
+              setRoute(null);
+              setShowDirections(false);
               setResults([]);
               setHasSearched(false);
               Keyboard.dismiss();
@@ -332,7 +450,9 @@ export default function HomeScreen({
           }}
         >
           <Text style={styles.favoritesHeaderButtonText}>
-            {showFavorites ? 'Back to Map' : `★ Favorites (${favoritePlaces.length})`}
+            {showFavorites
+              ? 'Back to Map'
+              : `★ Favorites (${favoritePlaces.length})`}
           </Text>
         </Pressable>
       </View>
@@ -378,10 +498,7 @@ export default function HomeScreen({
               keyboardShouldPersistTaps="handled"
             >
               {favoritePlaces.map((place) => (
-                <View
-                  key={place.id}
-                  style={styles.favoriteItem}
-                >
+                <View key={place.id} style={styles.favoriteItem}>
                   <Pressable
                     style={styles.favoriteItemContent}
                     onPress={() => openFavoriteOnMap(place)}
@@ -461,9 +578,7 @@ export default function HomeScreen({
                 {searchLoading ? (
                   <ActivityIndicator color="#ffffff" />
                 ) : (
-                  <Text style={styles.searchButtonText}>
-                    Search
-                  </Text>
+                  <Text style={styles.searchButtonText}>Search</Text>
                 )}
               </Pressable>
             </View>
@@ -474,13 +589,11 @@ export default function HomeScreen({
               </Text>
             )}
 
-            {!searchLoading &&
-              hasSearched &&
-              results.length === 0 && (
-                <Text style={styles.statusText}>
-                  No places found. Try a different search.
-                </Text>
-              )}
+            {!searchLoading && hasSearched && results.length === 0 && (
+              <Text style={styles.statusText}>
+                No places found. Try a different search.
+              </Text>
+            )}
 
             {results.length > 0 && (
               <ScrollView
@@ -494,17 +607,11 @@ export default function HomeScreen({
                     style={styles.resultItem}
                     onPress={() => selectPlace(place)}
                   >
-                    <Text
-                      style={styles.resultName}
-                      numberOfLines={1}
-                    >
+                    <Text style={styles.resultName} numberOfLines={1}>
                       {place.name}
                     </Text>
 
-                    <Text
-                      style={styles.resultAddress}
-                      numberOfLines={2}
-                    >
+                    <Text style={styles.resultAddress} numberOfLines={2}>
                       {place.address}
                     </Text>
                   </Pressable>
@@ -517,21 +624,42 @@ export default function HomeScreen({
             )}
           </View>
 
-          {/* Map */}
+          {/* Map and route */}
           <View style={styles.mapContainer}>
             <Map
               style={styles.map}
               mapStyle="https://tiles.openfreemap.org/styles/liberty"
             >
               <Camera
-  ref={cameraRef}
-  initialViewState={{
-    center: selectedPlace
-      ? [selectedPlace.longitude, selectedPlace.latitude]
-      : INITIAL_CENTER,
-    zoom: selectedPlace ? 15 : 10,
-  }}
-/>
+                ref={cameraRef}
+                initialViewState={{
+                  center: selectedPlace
+                    ? [selectedPlace.longitude, selectedPlace.latitude]
+                    : INITIAL_CENTER,
+                  zoom: selectedPlace ? 15 : 10,
+                }}
+              />
+
+              {routeGeoJSON && (
+                <GeoJSONSource
+                  id="route-source"
+                  data={routeGeoJSON}
+                >
+                  <Layer
+                    id="route-line"
+                    type="line"
+                    paint={{
+                      'line-color': '#1769e0',
+                      'line-width': 5,
+                      'line-opacity': 0.9,
+                    }}
+                    layout={{
+                      'line-cap': 'round',
+                      'line-join': 'round',
+                    }}
+                  />
+                </GeoJSONSource>
+              )}
 
               {userCoordinates && (
                 <ViewAnnotation lngLat={userCoordinates}>
@@ -570,51 +698,143 @@ export default function HomeScreen({
             </Pressable>
           </View>
 
-          {/* Selected place and save/remove button */}
+          {/* Selected place actions */}
           {selectedPlace && (
             <View style={styles.placeCard}>
               <View style={styles.placeText}>
-                <Text
-                  style={styles.placeTitle}
-                  numberOfLines={1}
-                >
+                <Text style={styles.placeTitle} numberOfLines={1}>
                   {selectedPlace.name}
                 </Text>
 
-                <Text
-                  style={styles.placeAddress}
-                  numberOfLines={2}
-                >
+                <Text style={styles.placeAddress} numberOfLines={2}>
                   {selectedPlace.address}
                 </Text>
               </View>
 
-              <Pressable
-                style={[
-                  styles.favoriteButton,
-                  favoriteLoading && styles.disabledButton,
-                ]}
-                onPress={toggleFavorite}
-                disabled={favoriteLoading}
-              >
-                {favoriteLoading ? (
-                  <ActivityIndicator color="#ffffff" />
-                ) : (
-                  <Text style={styles.favoriteButtonText}>
-                    {favoriteIds.includes(selectedPlace.id)
-                      ? '★ Saved'
-                      : '☆ Save'}
-                  </Text>
-                )}
-              </Pressable>
+              <View style={styles.placeActions}>
+                <Pressable
+                  style={[
+                    styles.directionsButton,
+                    routeLoading && styles.disabledButton,
+                  ]}
+                  onPress={handleGetDirections}
+                  disabled={routeLoading}
+                >
+                  {routeLoading ? (
+                    <ActivityIndicator color="#ffffff" />
+                  ) : (
+                    <Text style={styles.actionButtonText}>
+                      Directions
+                    </Text>
+                  )}
+                </Pressable>
 
-              <Pressable
-                style={styles.closeButton}
-                onPress={() => setSelectedPlace(null)}
-                accessibilityLabel="Close selected place"
+                <Pressable
+                  style={[
+                    styles.favoriteButton,
+                    favoriteLoading && styles.disabledButton,
+                  ]}
+                  onPress={toggleFavorite}
+                  disabled={favoriteLoading}
+                >
+                  {favoriteLoading ? (
+                    <ActivityIndicator color="#ffffff" />
+                  ) : (
+                    <Text style={styles.actionButtonText}>
+                      {favoriteIds.includes(selectedPlace.id)
+                        ? '★ Saved'
+                        : '☆ Save'}
+                    </Text>
+                  )}
+                </Pressable>
+
+                <Pressable
+                  style={styles.closeButton}
+                  onPress={() => {
+                    setSelectedPlace(null);
+                    setRoute(null);
+                    setShowDirections(false);
+                  }}
+                  accessibilityLabel="Close selected place"
+                >
+                  <Text style={styles.closeButtonText}>✕</Text>
+                </Pressable>
+              </View>
+            </View>
+          )}
+
+          {/* Route summary and step-by-step directions */}
+          {route && showDirections && (
+            <View style={styles.directionsPanel}>
+              <View style={styles.routeSummary}>
+                <View style={styles.routeSummaryItem}>
+                  <Text style={styles.routeSummaryValue}>
+                    {formatDistance(route.distance)}
+                  </Text>
+                  <Text style={styles.routeSummaryLabel}>Distance</Text>
+                </View>
+
+                <View style={styles.routeSummaryDivider} />
+
+                <View style={styles.routeSummaryItem}>
+                  <Text style={styles.routeSummaryValue}>
+                    {formatDuration(route.duration)}
+                  </Text>
+                  <Text style={styles.routeSummaryLabel}>
+                    Estimated drive
+                  </Text>
+                </View>
+
+                <Pressable
+                  style={styles.clearRouteButton}
+                  onPress={clearRoute}
+                >
+                  <Text style={styles.clearRouteText}>Clear route</Text>
+                </Pressable>
+              </View>
+
+              <Text style={styles.directionsHeading}>
+                Driving directions
+              </Text>
+
+              <ScrollView
+                style={styles.directionsList}
+                nestedScrollEnabled
+                keyboardShouldPersistTaps="handled"
               >
-                <Text style={styles.closeButtonText}>✕</Text>
-              </Pressable>
+                {route.steps.map((step, index) => (
+                  <View
+                    key={`${index}-${step.instruction}`}
+                    style={styles.directionStep}
+                  >
+                    <View style={styles.stepNumber}>
+                      <Text style={styles.stepNumberText}>
+                        {index + 1}
+                      </Text>
+                    </View>
+
+                    <View style={styles.stepTextContainer}>
+                      <Text style={styles.stepInstruction}>
+                        {step.instruction}
+                      </Text>
+
+                      {step.roadName.length > 0 && (
+                        <Text style={styles.stepRoadName}>
+                          {step.roadName}
+                        </Text>
+                      )}
+                    </View>
+
+                    <Text style={styles.stepDistance}>
+                      {formatDistance(step.distance)}
+                    </Text>
+                  </View>
+                ))}
+
+                <Text style={styles.routeDisclaimer}>
+                  Estimated route and travel time. Actual conditions may vary.
+                </Text>
+              </ScrollView>
             </View>
           )}
         </>
@@ -744,6 +964,7 @@ const styles = StyleSheet.create({
   },
   mapContainer: {
     flex: 1,
+    minHeight: 150,
     overflow: 'hidden',
   },
   map: {
@@ -800,8 +1021,6 @@ const styles = StyleSheet.create({
     backgroundColor: '#ffffff',
   },
   placeCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
     backgroundColor: '#ffffff',
     marginHorizontal: 12,
     marginTop: 8,
@@ -809,9 +1028,9 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     borderWidth: 1,
     borderColor: '#e4e7ec',
+    gap: 10,
   },
   placeText: {
-    flex: 1,
     minWidth: 0,
   },
   placeTitle: {
@@ -824,28 +1043,143 @@ const styles = StyleSheet.create({
     color: '#667085',
     fontSize: 12,
   },
-  favoriteButton: {
+  placeActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  directionsButton: {
+    flex: 1,
     backgroundColor: '#1769e0',
     borderRadius: 8,
     paddingHorizontal: 12,
-    paddingVertical: 10,
-    marginLeft: 8,
-    minWidth: 76,
+    paddingVertical: 11,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  favoriteButtonText: {
+  favoriteButton: {
+    flex: 1,
+    backgroundColor: '#1769e0',
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 11,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  actionButtonText: {
     color: '#ffffff',
     fontSize: 13,
     fontWeight: '600',
   },
   closeButton: {
-    paddingHorizontal: 10,
+    paddingHorizontal: 8,
     paddingVertical: 8,
   },
   closeButtonText: {
     color: '#667085',
     fontSize: 18,
+  },
+  directionsPanel: {
+    maxHeight: 245,
+    backgroundColor: '#ffffff',
+    marginHorizontal: 12,
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: '#e4e7ec',
+    borderRadius: 12,
+    padding: 12,
+  },
+  routeSummary: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingBottom: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#eaecf0',
+  },
+  routeSummaryItem: {
+    flex: 1,
+  },
+  routeSummaryValue: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#172033',
+  },
+  routeSummaryLabel: {
+    fontSize: 11,
+    color: '#667085',
+    marginTop: 3,
+  },
+  routeSummaryDivider: {
+    width: 1,
+    height: 32,
+    backgroundColor: '#e4e7ec',
+  },
+  clearRouteButton: {
+    backgroundColor: '#fff5f5',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+  },
+  clearRouteText: {
+    color: '#c53030',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  directionsHeading: {
+    color: '#172033',
+    fontSize: 14,
+    fontWeight: '700',
+    paddingTop: 10,
+    paddingBottom: 5,
+  },
+  directionsList: {
+    flexShrink: 1,
+  },
+  directionStep: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 9,
+    paddingVertical: 9,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f0f2f5',
+  },
+  stepNumber: {
+    width: 25,
+    height: 25,
+    borderRadius: 13,
+    backgroundColor: '#e8f1ff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  stepNumberText: {
+    color: '#1769e0',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  stepTextContainer: {
+    flex: 1,
+    minWidth: 0,
+  },
+  stepInstruction: {
+    color: '#172033',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  stepRoadName: {
+    color: '#667085',
+    fontSize: 11,
+    marginTop: 3,
+  },
+  stepDistance: {
+    color: '#667085',
+    fontSize: 11,
+    paddingTop: 4,
+  },
+  routeDisclaimer: {
+    color: '#667085',
+    fontSize: 10,
+    paddingVertical: 8,
   },
   favoritesContainer: {
     flex: 1,
